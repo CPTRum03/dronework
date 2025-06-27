@@ -1,715 +1,546 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Hand Gesture Recognition for Drone Control
+Updated version with modern libraries and improved code structure
+"""
+
 import csv
 import copy
 import argparse
 import itertools
-from collections import Counter
-from collections import deque
 import time
+import logging
+from collections import Counter, deque
+from pathlib import Path
+from typing import Optional, List, Tuple, Dict, Any
+
 import cv2 as cv
 import numpy as np
 import mediapipe as mp
-
 from pymavlink import mavutil
 
-from utils import CvFpsCalc
-from model import KeyPointClassifier
-from model import PointHistoryClassifier
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 
-def connect_to_sitl():
-    try:
-        master = mavutil.mavlink_connection('udp:127.0.0.1:14550')  #garbage value for port and ip make sure to change it according to your Arudpilot or PX4 port and laptop IP and check UDP or TCP 
-        print("Connected to SITL!")
-        return master
-    except Exception as e:
-        print(f"SITL connection failed:{e}")
-        return None
-def set_rc_override(master, roll=None, pitch=None, throttle=None, yaw=None):
-    """
-    Override RC channels for manual control.
-    Values typically range from 1000 to 2000 (PWM microseconds).
-    """
-    rc_channels = [65535] * 8  # Initialize all channels to "ignore" (65535)
+class DroneController:
+    """Handles MAVLink communication with drone/SITL"""
     
-    if roll is not None:
-        rc_channels[0] = roll  # Channel 1: Roll
-    if pitch is not None:
-        rc_channels[1] = pitch  # Channel 2: Pitch
-    if throttle is not None:
-        rc_channels[2] = throttle  # Channel 3: Throttle
-    if yaw is not None:
-        rc_channels[3] = yaw  # Channel 4: Yaw
+    def __init__(self, connection_string: str = 'udp:127.0.0.1:14550'):
+        self.connection_string = connection_string
+        self.master: Optional[mavutil.mavlink_connection] = None
+        self.connect()
     
-    # Send RC override command
-    master.mav.rc_channels_override_send(
-        master.target_system,
-        master.target_component,
-        *rc_channels[:8]  # Send first 8 channels
-    )
-def execute_drone_command(master, command, landmark_list=None):
-    if master is None:
-        print("Error: No MAVLink connection")
-        return
-
-    try:
-        # Always ensure we have a heartbeat first
-        master.wait_heartbeat()
-        
-        # Get current mode for debugging
-        current_mode = mavutil.mode_string_v10(master.recv_match(type='HEARTBEAT', blocking=True))
-        print(f"Current mode before command: {current_mode}")
-
-        # CIRCLE COMMANDS
-        if command in ["Circle Clockwise", "Circle Counter Clockwise"]:
-            # Verify CIRCLE mode is available
-            if 'CIRCLE' not in master.mode_mapping():
-                print("Error: CIRCLE mode not available!")
-                return
-
-            # Set CIRCLE mode
-            master.set_mode('CIRCLE')
-            print("Setting CIRCLE mode...")
-
-            # Send circle direction command
-            direction = 1 if command == "Circle Clockwise" else -1
-            master.mav.command_long_send(
-                master.target_system,
-                master.target_component,
-                mavutil.mavlink.MAV_CMD_DO_GO_AROUND,
-                0,       # Confirmation
-                5,       # Radius (meters)
-                2,       # Speed (m/s)
-                direction,  # 1=CW, -1=CCW
-                0, 0, 0, 0  # Unused params
-            )
-            print(f"Executed {command} (Radius:5m, Speed:2m/s)")
-
-        # GUIDED MODE COMMANDS
-        elif command in ["Arm", "Takeoff", "Yaw Clockwise", "Yaw Counter Clockwise"]:
-            # Set GUIDED mode first
-            master.set_mode('GUIDED')
-            print("Setting GUIDED mode...")
-
-            if command == "Arm":
-                master.mav.command_long_send(
-                    master.target_system,
-                    master.target_component,
-                    mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-                    0, 1, 0, 0, 0, 0, 0, 0  # 1 = ARM
-                )
-                print("Arm command sent")
-
-            elif command == "Takeoff":
-                master.mav.command_long_send(
-                    master.target_system,
-                    master.target_component,
-                    mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-                    0, 0, 0, 0, 0, 0, 0, 15  # Altitude = 15m
-                )
-                print("Takeoff command sent (15m)")
-
-            elif "Yaw" in command:
-                direction = 1 if "Clockwise" in command else -1
-                master.mav.command_long_send(
-                    master.target_system,
-                    master.target_component,
-                    mavutil.mavlink.MAV_CMD_CONDITION_YAW,
-                    0,       # Confirmation
-                    360,     # Angle (degrees)
-                    30,      # Speed (deg/s)
-                    direction,  # Direction
-                    1,       # Relative (1) or absolute (0)
-                    0, 0, 0  # Unused params
-                )
-                print(f"Yaw command sent ({'CW' if direction==1 else 'CCW'})")
-
-        # SPECIAL MODES (No mode change needed)
-        elif command == "Disarm":
-            master.mav.command_long_send(
-                master.target_system,
-                master.target_component,
-                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-                0, 0, 0, 0, 0, 0, 0, 0  # 0 = DISARM
-            )
-            print("Disarm command sent")
-
-        elif command == "Return to Land":
-            master.mav.command_long_send(
-                master.target_system,
-                master.target_component,
-                mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
-                0, 0, 0, 0, 0, 0, 0, 0
-            )
-            print("RTL command sent")
-
-        elif command == "Follow":
-            if landmark_list is None:
-                print("No landmark data for follow command")
-                return
-                
-            # Get hand position from landmark 8 (index fingertip)
-            hand_x, hand_y = landmark_list[8][0], landmark_list[8][1]
+    def connect(self) -> bool:
+        """Establish connection to SITL/drone"""
+        try:
+            self.master = mavutil.mavlink_connection(self.connection_string)
+            logger.info(f"Connected to drone at {self.connection_string}")
+            return True
+        except Exception as e:
+            logger.error(f"Connection failed: {e}")
+            return False
+    
+    def set_rc_override(self, roll: Optional[int] = None, pitch: Optional[int] = None, 
+                       throttle: Optional[int] = None, yaw: Optional[int] = None):
+        """Override RC channels for manual control (1000-2000 PWM)"""
+        if not self.master:
+            logger.warning("No MAVLink connection available")
+            return
             
-            # Convert hand position to drone movement commands
-            if hand_x < 300:  # Left edge of frame
-                set_rc_override(master, roll=1400)  # Move left
-            elif hand_x > 600:  # Right edge
-                set_rc_override(master, roll=1600)  # Move right
-            if hand_y < 200:  # Top edge
-                set_rc_override(master, throttle=1600)  # Ascend
-            elif hand_y > 400:  # Bottom edge
-                set_rc_override(master, throttle=1400)  # Descend
-            print("Follow mode active")
+        rc_channels = [65535] * 8  # Initialize all channels to "ignore"
+        
+        if roll is not None:
+            rc_channels[0] = max(1000, min(2000, roll))
+        if pitch is not None:
+            rc_channels[1] = max(1000, min(2000, pitch))
+        if throttle is not None:
+            rc_channels[2] = max(1000, min(2000, throttle))
+        if yaw is not None:
+            rc_channels[3] = max(1000, min(2000, yaw))
+        
+        self.master.mav.rc_channels_override_send(
+            self.master.target_system,
+            self.master.target_component,
+            *rc_channels[:8]
+        )
+    
+    def execute_command(self, command: str, landmark_list: Optional[List] = None):
+        """Execute drone command based on gesture recognition"""
+        if not self.master:
+            logger.error("No MAVLink connection")
+            return False
+        
+        try:
+            # Ensure heartbeat
+            self.master.wait_heartbeat()
+            
+            command_map = {
+                "Circle Clockwise": self._circle_command,
+                "Circle Counter Clockwise": self._circle_command,
+                "Arm": self._arm_command,
+                "Disarm": self._disarm_command,
+                "Takeoff": self._takeoff_command,
+                "Return to Land": self._rtl_command,
+                "Yaw Clockwise": self._yaw_command,
+                "Yaw Counter Clockwise": self._yaw_command,
+                "Follow": self._follow_command
+            }
+            
+            if command in command_map:
+                return command_map[command](command, landmark_list)
+            else:
+                logger.warning(f"Unknown command: {command}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Command execution failed: {e}")
+            return False
+    
+    def _circle_command(self, command: str, landmark_list: Optional[List] = None):
+        """Execute circle command"""
+        if 'CIRCLE' not in self.master.mode_mapping():
+            logger.error("CIRCLE mode not available")
+            return False
+        
+        self.master.set_mode('CIRCLE')
+        direction = 1 if "Clockwise" in command else -1
+        
+        self.master.mav.command_long_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_CMD_DO_GO_AROUND,
+            0, 5, 2, direction, 0, 0, 0, 0
+        )
+        logger.info(f"Executed {command} (Radius:5m, Speed:2m/s)")
+        return True
+    
+    def _arm_command(self, command: str, landmark_list: Optional[List] = None):
+        """Arm the drone"""
+        self.master.set_mode('GUIDED')
+        self.master.mav.command_long_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0, 1, 0, 0, 0, 0, 0, 0
+        )
+        logger.info("Arm command sent")
+        return True
+    
+    def _disarm_command(self, command: str, landmark_list: Optional[List] = None):
+        """Disarm the drone"""
+        self.master.mav.command_long_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0, 0, 0, 0, 0, 0, 0, 0
+        )
+        logger.info("Disarm command sent")
+        return True
+    
+    def _takeoff_command(self, command: str, landmark_list: Optional[List] = None):
+        """Execute takeoff command"""
+        self.master.set_mode('GUIDED')
+        self.master.mav.command_long_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+            0, 0, 0, 0, 0, 0, 0, 15
+        )
+        logger.info("Takeoff command sent (15m)")
+        return True
+    
+    def _rtl_command(self, command: str, landmark_list: Optional[List] = None):
+        """Return to launch"""
+        self.master.mav.command_long_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
+            0, 0, 0, 0, 0, 0, 0, 0
+        )
+        logger.info("RTL command sent")
+        return True
+    
+    def _yaw_command(self, command: str, landmark_list: Optional[List] = None):
+        """Execute yaw command"""
+        self.master.set_mode('GUIDED')
+        direction = 1 if "Clockwise" in command else -1
+        
+        self.master.mav.command_long_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_CMD_CONDITION_YAW,
+            0, 360, 30, direction, 1, 0, 0, 0
+        )
+        logger.info(f"Yaw command sent ({'CW' if direction == 1 else 'CCW'})")
+        return True
+    
+    def _follow_command(self, command: str, landmark_list: Optional[List] = None):
+        """Execute follow command using hand position"""
+        if not landmark_list or len(landmark_list) < 9:
+            logger.warning("No landmark data for follow command")
+            return False
+        
+        # Use index fingertip (landmark 8) for control
+        hand_x, hand_y = landmark_list[8][0], landmark_list[8][1]
+        
+        # Convert hand position to drone movement (adjust thresholds as needed)
+        roll = pitch = throttle = yaw = None
+        
+        if hand_x < 300:  # Left
+            roll = 1400
+        elif hand_x > 600:  # Right
+            roll = 1600
+            
+        if hand_y < 200:  # Up
+            throttle = 1600
+        elif hand_y > 400:  # Down
+            throttle = 1400
+        
+        self.set_rc_override(roll=roll, pitch=pitch, throttle=throttle, yaw=yaw)
+        logger.info("Follow mode active")
+        return True
 
-        # Verify mode change was successful
-        msg = master.recv_match(type='HEARTBEAT', blocking=True, timeout=3)
-        if msg:
-            new_mode = mavutil.mode_string_v10(msg)
-            print(f"Mode after command: {new_mode}")
-        else:
-            print("Warning: Couldn't verify mode change!")
 
-    except Exception as e:
-        print(f"Command failed: {str(e)}")
-
-
-def get_args():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--width", help='cap width', type=int, default=960)
-    parser.add_argument("--height", help='cap height', type=int, default=540)
-
-    parser.add_argument('--use_static_image_mode', action='store_true')
-    parser.add_argument("--min_detection_confidence",
-                        help='min_detection_confidence',
-                        type=float,
-                        default=0.7)
-    parser.add_argument("--min_tracking_confidence",
-                        help='min_tracking_confidence',
-                        type=int,
-                        default=0.5)
-
-    args,_ = parser.parse_known_args()
-
-    return args
-
-
-def main():
-    master = connect_to_sitl()
-    # Argument parsing #################################################################
-    args = get_args()
-
-    cap_device = args.device
-    cap_width = args.width
-    cap_height = args.height
-
-    use_static_image_mode = args.use_static_image_mode
-    min_detection_confidence = args.min_detection_confidence
-    min_tracking_confidence = args.min_tracking_confidence
-
-    use_brect = True
-
-    # Camera preparation ###############################################################
-    cap = cv.VideoCapture(cap_device)
-    cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
-    cap.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
-
-    # Model load #############################################################
-    mp_hands = mp.solutions.hands
-    hands = mp_hands.Hands(
-        static_image_mode=use_static_image_mode,
-        max_num_hands=1,
-        min_detection_confidence=min_detection_confidence,
-        min_tracking_confidence=min_tracking_confidence,
-    )
-
-    keypoint_classifier = KeyPointClassifier()
-
-    point_history_classifier = PointHistoryClassifier()
-
-    # Read labels ###########################################################
-    with open('model/keypoint_classifier/keypoint_classifier_label.csv',
-              encoding='utf-8-sig') as f:
-        keypoint_classifier_labels = csv.reader(f)
-        keypoint_classifier_labels = [
-            row[0] for row in keypoint_classifier_labels
-        ]
-    with open(
-            'model/point_history_classifier/point_history_classifier_label.csv',
-            encoding='utf-8-sig') as f:
-        point_history_classifier_labels = csv.reader(f)
-        point_history_classifier_labels = [
-            row[0] for row in point_history_classifier_labels
-        ]
-
-    # FPS Measurement ########################################################
-    cvFpsCalc = CvFpsCalc(buffer_len=10)
-
-    # Coordinate history #################################################################
-    history_length = 16
-    point_history = deque(maxlen=history_length)
-
-    # Finger gesture history ################################################
-    finger_gesture_history = deque(maxlen=history_length)
-
-    #  ########################################################################
-    mode = 0
-    last_command = None
-    last_command_time = 0
-    command_cooldown = 10
-
-    while True:
-        fps = cvFpsCalc.get()
-
-        # Process Key (ESC: end) #################################################
-        key = cv.waitKey(10)
-        if key == 27:  # ESC
-            break
-        number, mode = select_mode(key, mode)
-
-        # Camera capture #####################################################
-        ret, image = cap.read()
-        if not ret:
-            break
-        image = cv.flip(image, 1)  # Mirror display
+class HandGestureRecognizer:
+    """Handles hand gesture recognition using MediaPipe"""
+    
+    def __init__(self, min_detection_confidence: float = 0.7, 
+                 min_tracking_confidence: float = 0.5):
+        self.mp_hands = mp.solutions.hands
+        self.hands = self.mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            min_detection_confidence=min_detection_confidence,
+            min_tracking_confidence=min_tracking_confidence,
+        )
+        
+        # Load classifiers (assuming these classes exist)
+        try:
+            from model import KeyPointClassifier, PointHistoryClassifier
+            self.keypoint_classifier = KeyPointClassifier()
+            self.point_history_classifier = PointHistoryClassifier()
+        except ImportError:
+            logger.warning("Classifier models not found. Using dummy classifiers.")
+            self.keypoint_classifier = None
+            self.point_history_classifier = None
+        
+        # Load labels
+        self.keypoint_labels = self._load_labels('model/keypoint_classifier/keypoint_classifier_label.csv')
+        self.point_history_labels = self._load_labels('model/point_history_classifier/point_history_classifier_label.csv')
+        
+        # History tracking
+        self.history_length = 16
+        self.point_history = deque(maxlen=self.history_length)
+        self.finger_gesture_history = deque(maxlen=self.history_length)
+    
+    def _load_labels(self, filepath: str) -> List[str]:
+        """Load classifier labels from CSV file"""
+        labels = []
+        try:
+            with open(filepath, 'r', encoding='utf-8-sig') as f:
+                reader = csv.reader(f)
+                labels = [row[0] for row in reader]
+        except FileNotFoundError:
+            logger.warning(f"Label file not found: {filepath}")
+        return labels
+    
+    def process_frame(self, image: np.ndarray) -> Tuple[Optional[str], List, np.ndarray]:
+        """Process a single frame and return gesture classification"""
+        image_rgb = cv.cvtColor(image, cv.COLOR_BGR2RGB)
+        image_rgb.flags.writeable = False
+        results = self.hands.process(image_rgb)
+        image_rgb.flags.writeable = True
+        
         debug_image = copy.deepcopy(image)
-
-        # Detection implementation #############################################################
-        image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
-
-        image.flags.writeable = False
-        results = hands.process(image)
-        image.flags.writeable = True
-
-        #  ####################################################################
-        if results.multi_hand_landmarks is not None:
-            for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
+        detected_command = None
+        landmark_list = []
+        
+        if results.multi_hand_landmarks:
+            for hand_landmarks, handedness in zip(results.multi_hand_landmarks, 
                                                   results.multi_handedness):
-                # Bounding box calculation
-                brect = calc_bounding_rect(debug_image, hand_landmarks)
-                # Landmark calculation
-                landmark_list = calc_landmark_list(debug_image, hand_landmarks)
-
-                # Conversion to relative coordinates / normalized coordinates
-                pre_processed_landmark_list = pre_process_landmark(
-                    landmark_list)
-                pre_processed_point_history_list = pre_process_point_history(
-                    debug_image, point_history)
-                # Write to the dataset file
-                logging_csv(number, mode, pre_processed_landmark_list,
-                            pre_processed_point_history_list)
-
-                # Hand sign classification
-                hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
-                if hand_sign_id != "nA":  # Point gesture
-                    command = keypoint_classifier_labels[hand_sign_id]
-                    current_time = time.time()
-                    if command == "Follow":
-                        print(f"Detected command: {command}")
-                        execute_drone_command(master, command, landmark_list)
-                    elif command != last_command or (current_time - last_command_time) > command_cooldown:
-                        print(f"Detected command: {command}")
-                        execute_drone_command(master, command)
-                        last_command = command
-                        last_command_time = current_time
-                else:
-                    point_history.append([0, 0])
-
-                # Finger gesture classification
+                # Calculate landmarks
+                landmark_list = self._calc_landmark_list(debug_image, hand_landmarks)
+                brect = self._calc_bounding_rect(debug_image, hand_landmarks)
+                
+                # Preprocess landmarks
+                processed_landmarks = self._preprocess_landmark(landmark_list)
+                processed_point_history = self._preprocess_point_history(debug_image, self.point_history)
+                
+                # Classify hand sign
+                if self.keypoint_classifier and processed_landmarks:
+                    hand_sign_id = self.keypoint_classifier(processed_landmarks)
+                    if isinstance(hand_sign_id, int) and 0 <= hand_sign_id < len(self.keypoint_labels):
+                        detected_command = self.keypoint_labels[hand_sign_id]
+                        self.point_history.append(landmark_list[8])  # Index fingertip
+                    else:
+                        self.point_history.append([0, 0])
+                
+                # Classify finger gesture
                 finger_gesture_id = 0
-                point_history_len = len(pre_processed_point_history_list)
-                if point_history_len == (history_length * 2):
-                    finger_gesture_id = point_history_classifier(
-                        pre_processed_point_history_list)
-
-                # Calculates the gesture IDs in the latest detection
-                finger_gesture_history.append(finger_gesture_id)
-                most_common_fg_id = Counter(
-                    finger_gesture_history).most_common()
-
-                # Drawing part
-                debug_image = draw_bounding_rect(use_brect, debug_image, brect)
-                debug_image = draw_landmarks(debug_image, landmark_list)
-                debug_image = draw_info_text(
-                    debug_image,
-                    brect,
-                    handedness,
-                    keypoint_classifier_labels[hand_sign_id],
-                    point_history_classifier_labels[most_common_fg_id[0][0]],
+                if (self.point_history_classifier and 
+                    len(processed_point_history) == (self.history_length * 2)):
+                    finger_gesture_id = self.point_history_classifier(processed_point_history)
+                
+                self.finger_gesture_history.append(finger_gesture_id)
+                most_common_fg = Counter(self.finger_gesture_history).most_common(1)
+                
+                # Draw on debug image
+                debug_image = self._draw_landmarks(debug_image, landmark_list)
+                debug_image = self._draw_bounding_rect(debug_image, brect)
+                debug_image = self._draw_info_text(
+                    debug_image, brect, handedness, 
+                    detected_command or "", 
+                    self.point_history_labels[most_common_fg[0][0]] if most_common_fg and self.point_history_labels else ""
                 )
         else:
-            point_history.append([0, 0])
-
-        debug_image = draw_point_history(debug_image, point_history)
-        debug_image = draw_info(debug_image, fps, mode, number)
-
-        # Screen reflection #############################################################
-        cv.imshow('Hand Gesture Recognition', debug_image)
-
-    cap.release()
-    cv.destroyAllWindows()
-
-
-def select_mode(key, mode):
-    number = -1
-    if 48 <= key <= 57:  # 0 ~ 9
-        number = key - 48
-    if key == 110:  # n
-        mode = 0
-    if key == 107:  # k
-        mode = 1
-    if key == 104:  # h
-        mode = 2
-    return number, mode
-
-
-def calc_bounding_rect(image, landmarks):
-    image_width, image_height = image.shape[1], image.shape[0]
-
-    landmark_array = np.empty((0, 2), int)
-
-    for _, landmark in enumerate(landmarks.landmark):
-        landmark_x = min(int(landmark.x * image_width), image_width - 1)
-        landmark_y = min(int(landmark.y * image_height), image_height - 1)
-
-        landmark_point = [np.array((landmark_x, landmark_y))]
-
-        landmark_array = np.append(landmark_array, landmark_point, axis=0)
-
-    x, y, w, h = cv.boundingRect(landmark_array)
-
-    return [x, y, x + w, y + h]
-
-
-def calc_landmark_list(image, landmarks):
-    image_width, image_height = image.shape[1], image.shape[0]
-
-    landmark_point = []
-
-    # Keypoint
-    for _, landmark in enumerate(landmarks.landmark):
-        landmark_x = min(int(landmark.x * image_width), image_width - 1)
-        landmark_y = min(int(landmark.y * image_height), image_height - 1)
-        # landmark_z = landmark.z
-
-        landmark_point.append([landmark_x, landmark_y])
-
-    return landmark_point
-
-
-def pre_process_landmark(landmark_list):
-    temp_landmark_list = copy.deepcopy(landmark_list)
-
-    # Convert to relative coordinates
-    base_x, base_y = 0, 0
-    for index, landmark_point in enumerate(temp_landmark_list):
-        if index == 0:
-            base_x, base_y = landmark_point[0], landmark_point[1]
-
-        temp_landmark_list[index][0] = temp_landmark_list[index][0] - base_x
-        temp_landmark_list[index][1] = temp_landmark_list[index][1] - base_y
-
-    # Convert to a one-dimensional list
-    temp_landmark_list = list(
-        itertools.chain.from_iterable(temp_landmark_list))
-
-    # Normalization
-    max_value = max(list(map(abs, temp_landmark_list)))
-
-    def normalize_(n):
-        return n / max_value
-
-    temp_landmark_list = list(map(normalize_, temp_landmark_list))
-
-    return temp_landmark_list
-
-
-def pre_process_point_history(image, point_history):
-    image_width, image_height = image.shape[1], image.shape[0]
-
-    temp_point_history = copy.deepcopy(point_history)
-
-    # Convert to relative coordinates
-    base_x, base_y = 0, 0
-    for index, point in enumerate(temp_point_history):
-        if index == 0:
-            base_x, base_y = point[0], point[1]
-
-        temp_point_history[index][0] = (temp_point_history[index][0] -
-                                        base_x) / image_width
-        temp_point_history[index][1] = (temp_point_history[index][1] -
-                                        base_y) / image_height
-
-    # Convert to a one-dimensional list
-    temp_point_history = list(
-        itertools.chain.from_iterable(temp_point_history))
-
-    return temp_point_history
-
-
-def logging_csv(number, mode, landmark_list, point_history_list):
-    if mode == 0:
-        pass
-    if mode == 1 and (0 <= number <= 9):
-        csv_path = 'model/keypoint_classifier/keypoint.csv'
-        with open(csv_path, 'a', newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([number, *landmark_list])
-    if mode == 2 and (0 <= number <= 9):
-        csv_path = 'model/point_history_classifier/point_history.csv'
-        with open(csv_path, 'a', newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([number, *point_history_list])
-    return
-
-
-def draw_landmarks(image, landmark_point):
-    if len(landmark_point) > 0:
-        # Thumb
-        cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[3]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[3]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[3]), tuple(landmark_point[4]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[3]), tuple(landmark_point[4]),
-                (255, 255, 255), 2)
-
-        # Index finger
-        cv.line(image, tuple(landmark_point[5]), tuple(landmark_point[6]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[5]), tuple(landmark_point[6]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[6]), tuple(landmark_point[7]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[6]), tuple(landmark_point[7]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[7]), tuple(landmark_point[8]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[7]), tuple(landmark_point[8]),
-                (255, 255, 255), 2)
-
-        # Middle finger
-        cv.line(image, tuple(landmark_point[9]), tuple(landmark_point[10]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[9]), tuple(landmark_point[10]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[10]), tuple(landmark_point[11]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[10]), tuple(landmark_point[11]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[11]), tuple(landmark_point[12]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[11]), tuple(landmark_point[12]),
-                (255, 255, 255), 2)
-
-        # Ring finger
-        cv.line(image, tuple(landmark_point[13]), tuple(landmark_point[14]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[13]), tuple(landmark_point[14]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[14]), tuple(landmark_point[15]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[14]), tuple(landmark_point[15]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[15]), tuple(landmark_point[16]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[15]), tuple(landmark_point[16]),
-                (255, 255, 255), 2)
-
-        # Little finger
-        cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[18]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[18]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[18]), tuple(landmark_point[19]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[18]), tuple(landmark_point[19]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[19]), tuple(landmark_point[20]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[19]), tuple(landmark_point[20]),
-                (255, 255, 255), 2)
-
-        # Palm
-        cv.line(image, tuple(landmark_point[0]), tuple(landmark_point[1]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[0]), tuple(landmark_point[1]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[1]), tuple(landmark_point[2]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[1]), tuple(landmark_point[2]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[5]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[5]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[5]), tuple(landmark_point[9]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[5]), tuple(landmark_point[9]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[9]), tuple(landmark_point[13]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[9]), tuple(landmark_point[13]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[13]), tuple(landmark_point[17]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[13]), tuple(landmark_point[17]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[0]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[0]),
-                (255, 255, 255), 2)
-
-    # Key Points
-    for index, landmark in enumerate(landmark_point):
-        if index == 0:  # 手首1
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 1:  # 手首2
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 2:  # 親指：付け根
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 3:  # 親指：第1関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 4:  # 親指：指先
-            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 5:  # 人差指：付け根
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 6:  # 人差指：第2関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 7:  # 人差指：第1関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 8:  # 人差指：指先
-            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 9:  # 中指：付け根
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 10:  # 中指：第2関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 11:  # 中指：第1関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 12:  # 中指：指先
-            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 13:  # 薬指：付け根
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 14:  # 薬指：第2関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 15:  # 薬指：第1関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 16:  # 薬指：指先
-            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 17:  # 小指：付け根
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 18:  # 小指：第2関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 19:  # 小指：第1関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 20:  # 小指：指先
-            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-
-    return image
+            self.point_history.append([0, 0])
+        
+        debug_image = self._draw_point_history(debug_image, self.point_history)
+        
+        return detected_command, landmark_list, debug_image
+    
+    def _calc_landmark_list(self, image: np.ndarray, landmarks) -> List[List[int]]:
+        """Calculate landmark coordinates"""
+        image_height, image_width = image.shape[:2]
+        landmark_points = []
+        
+        for landmark in landmarks.landmark:
+            x = min(int(landmark.x * image_width), image_width - 1)
+            y = min(int(landmark.y * image_height), image_height - 1)
+            landmark_points.append([x, y])
+        
+        return landmark_points
+    
+    def _calc_bounding_rect(self, image: np.ndarray, landmarks) -> List[int]:
+        """Calculate bounding rectangle for hand"""
+        image_height, image_width = image.shape[:2]
+        landmark_array = np.empty((0, 2), int)
+        
+        for landmark in landmarks.landmark:
+            x = min(int(landmark.x * image_width), image_width - 1)
+            y = min(int(landmark.y * image_height), image_height - 1)
+            landmark_array = np.append(landmark_array, [[x, y]], axis=0)
+        
+        x, y, w, h = cv.boundingRect(landmark_array)
+        return [x, y, x + w, y + h]
+    
+    def _preprocess_landmark(self, landmark_list: List[List[int]]) -> List[float]:
+        """Preprocess landmarks for classification"""
+        if not landmark_list:
+            return []
+        
+        temp_landmarks = copy.deepcopy(landmark_list)
+        
+        # Convert to relative coordinates
+        base_x, base_y = temp_landmarks[0]
+        for i, point in enumerate(temp_landmarks):
+            temp_landmarks[i][0] -= base_x
+            temp_landmarks[i][1] -= base_y
+        
+        # Flatten and normalize
+        flat_landmarks = list(itertools.chain.from_iterable(temp_landmarks))
+        max_value = max(map(abs, flat_landmarks)) if flat_landmarks else 1
+        
+        return [n / max_value for n in flat_landmarks]
+    
+    def _preprocess_point_history(self, image: np.ndarray, point_history: deque) -> List[float]:
+        """Preprocess point history for classification"""
+        image_height, image_width = image.shape[:2]
+        temp_history = copy.deepcopy(point_history)
+        
+        if not temp_history:
+            return []
+        
+        # Convert to relative coordinates
+        base_x, base_y = temp_history[0] if temp_history[0] != [0, 0] else [0, 0]
+        for i, point in enumerate(temp_history):
+            if point != [0, 0]:
+                temp_history[i][0] = (point[0] - base_x) / image_width
+                temp_history[i][1] = (point[1] - base_y) / image_height
+        
+        return list(itertools.chain.from_iterable(temp_history))
+    
+    def _draw_landmarks(self, image: np.ndarray, landmark_points: List[List[int]]) -> np.ndarray:
+        """Draw hand landmarks on image"""
+        if not landmark_points or len(landmark_points) < 21:
+            return image
+        
+        # Hand connections (simplified)
+        connections = [
+            (0, 1), (1, 2), (2, 5), (5, 9), (9, 13), (13, 17), (17, 0),  # Palm
+            (2, 3), (3, 4),  # Thumb
+            (5, 6), (6, 7), (7, 8),  # Index
+            (9, 10), (10, 11), (11, 12),  # Middle
+            (13, 14), (14, 15), (15, 16),  # Ring
+            (17, 18), (18, 19), (19, 20),  # Pinky
+        ]
+        
+        # Draw connections
+        for start_idx, end_idx in connections:
+            if start_idx < len(landmark_points) and end_idx < len(landmark_points):
+                start_point = tuple(landmark_points[start_idx])
+                end_point = tuple(landmark_points[end_idx])
+                cv.line(image, start_point, end_point, (255, 255, 255), 2)
+        
+        # Draw landmarks
+        for i, point in enumerate(landmark_points):
+            radius = 8 if i in [4, 8, 12, 16, 20] else 5  # Fingertips larger
+            cv.circle(image, tuple(point), radius, (255, 255, 255), -1)
+            cv.circle(image, tuple(point), radius, (0, 0, 0), 1)
+        
+        return image
+    
+    def _draw_bounding_rect(self, image: np.ndarray, brect: List[int]) -> np.ndarray:
+        """Draw bounding rectangle"""
+        cv.rectangle(image, (brect[0], brect[1]), (brect[2], brect[3]), (0, 255, 0), 2)
+        return image
+    
+    def _draw_info_text(self, image: np.ndarray, brect: List[int], handedness, 
+                       hand_sign_text: str, finger_gesture_text: str) -> np.ndarray:
+        """Draw information text"""
+        cv.rectangle(image, (brect[0], brect[1]), (brect[2], brect[1] - 22), (0, 0, 0), -1)
+        
+        info_text = handedness.classification[0].label
+        if hand_sign_text:
+            info_text += f': {hand_sign_text}'
+        
+        cv.putText(image, info_text, (brect[0] + 5, brect[1] - 4),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        
+        return image
+    
+    def _draw_point_history(self, image: np.ndarray, point_history: deque) -> np.ndarray:
+        """Draw point history trail"""
+        for i, point in enumerate(point_history):
+            if point[0] != 0 and point[1] != 0:
+                cv.circle(image, tuple(point), 1 + int(i / 2), (152, 251, 152), 2)
+        return image
 
 
-def draw_bounding_rect(use_brect, image, brect):
-    if use_brect:
-        # Outer rectangle
-        cv.rectangle(image, (brect[0], brect[1]), (brect[2], brect[3]),
-                     (0, 0, 0), 1)
-
-    return image
-
-
-def draw_info_text(image, brect, handedness, hand_sign_text,
-                   finger_gesture_text):
-    cv.rectangle(image, (brect[0], brect[1]), (brect[2], brect[1] - 22),
-                 (0, 0, 0), -1)
-
-    info_text = handedness.classification[0].label[0:]
-    if hand_sign_text != "":
-        info_text = info_text + ':' + hand_sign_text
-    cv.putText(image, info_text, (brect[0] + 5, brect[1] - 4),
-               cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
-
-    #if finger_gesture_text != "":
-     #   cv.putText(image, "Finger Gesture:" + finger_gesture_text, (10, 60),
-      #             cv.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4, cv.LINE_AA)
-       # cv.putText(image, "Finger Gesture:" + finger_gesture_text, (10, 60),
-        #           cv.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2,
-         #          cv.LINE_AA)
-
-    return image
+class FPSCalculator:
+    """Simple FPS calculator"""
+    
+    def __init__(self, buffer_len: int = 10):
+        self.buffer_len = buffer_len
+        self.timestamps = deque(maxlen=buffer_len)
+    
+    def update(self) -> float:
+        """Update and return current FPS"""
+        self.timestamps.append(time.time())
+        if len(self.timestamps) < 2:
+            return 0.0
+        
+        time_diff = self.timestamps[-1] - self.timestamps[0]
+        return (len(self.timestamps) - 1) / time_diff if time_diff > 0 else 0.0
 
 
-def draw_point_history(image, point_history):
-    for index, point in enumerate(point_history):
-        if point[0] != 0 and point[1] != 0:
-            cv.circle(image, (point[0], point[1]), 1 + int(index / 2),
-                      (152, 251, 152), 2)
+class DroneGestureController:
+    """Main application class"""
+    
+    def __init__(self, args):
+        self.args = args
+        self.drone_controller = DroneController()
+        self.gesture_recognizer = HandGestureRecognizer(
+            min_detection_confidence=args.min_detection_confidence,
+            min_tracking_confidence=args.min_tracking_confidence
+        )
+        self.fps_calculator = FPSCalculator()
+        
+        # Command cooldown to prevent spam
+        self.last_command = None
+        self.last_command_time = 0
+        self.command_cooldown = 2.0  # seconds
+        
+        # Setup camera
+        self.cap = cv.VideoCapture(args.device)
+        self.cap.set(cv.CAP_PROP_FRAME_WIDTH, args.width)
+        self.cap.set(cv.CAP_PROP_FRAME_HEIGHT, args.height)
+    
+    def run(self):
+        """Main application loop"""
+        logger.info("Starting drone gesture control application")
+        
+        try:
+            while True:
+                ret, frame = self.cap.read()
+                if not ret:
+                    logger.error("Failed to read from camera")
+                    break
+                
+                # Mirror the frame
+                frame = cv.flip(frame, 1)
+                
+                # Process frame
+                command, landmark_list, debug_image = self.gesture_recognizer.process_frame(frame)
+                
+                # Execute drone command with cooldown
+                current_time = time.time()
+                if command and (command != self.last_command or 
+                               (current_time - self.last_command_time) > self.command_cooldown):
+                    
+                    if command == "Follow":
+                        # Follow command can be executed continuously
+                        self.drone_controller.execute_command(command, landmark_list)
+                    else:
+                        # Other commands have cooldown
+                        self.drone_controller.execute_command(command, landmark_list)
+                        self.last_command = command
+                        self.last_command_time = current_time
+                
+                # Update FPS and draw info
+                fps = self.fps_calculator.update()
+                self._draw_info(debug_image, fps)
+                
+                # Display
+                cv.imshow('Hand Gesture Drone Control', debug_image)
+                
+                # Check for exit
+                key = cv.waitKey(1) & 0xFF
+                if key == ord('q') or key == 27:  # 'q' or ESC
+                    break
+                    
+        except KeyboardInterrupt:
+            logger.info("Application interrupted by user")
+        except Exception as e:
+            logger.error(f"Application error: {e}")
+        finally:
+            self.cleanup()
+    
+    def _draw_info(self, image: np.ndarray, fps: float):
+        """Draw application info on image"""
+        cv.putText(image, f"FPS: {fps:.1f}", (10, 30), 
+                   cv.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+        cv.putText(image, "Press 'q' or ESC to quit", (10, image.shape[0] - 20), 
+                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+    
+    def cleanup(self):
+        """Cleanup resources"""
+        self.cap.release()
+        cv.destroyAllWindows()
+        logger.info("Application cleanup completed")
 
-    return image
 
-
-def draw_info(image, fps, mode, number):
-    cv.putText(image, "FPS:" + str(fps), (10, 30), cv.FONT_HERSHEY_SIMPLEX,
-               1.0, (0, 0, 0), 4, cv.LINE_AA)
-    cv.putText(image, "FPS:" + str(fps), (10, 30), cv.FONT_HERSHEY_SIMPLEX,
-               1.0, (255, 255, 255), 2, cv.LINE_AA)
-
-    mode_string = ['Logging Key Point', 'Logging Point History']
-    if 1 <= mode <= 2:
-        cv.putText(image, "MODE:" + mode_string[mode - 1], (10, 90),
-                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1,
-                   cv.LINE_AA)
-        if 0 <= number <= 9:
-            cv.putText(image, "NUM:" + str(number), (10, 110),
-                       cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1,
-                       cv.LINE_AA)
-    return image
+def parse_arguments():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description="Hand Gesture Drone Control")
+    
+    parser.add_argument("--device", type=int, default=0, help="Camera device index")
+    parser.add_argument("--width", type=int, default=960, help="Camera width")
+    parser.add_argument("--height", type=int, default=540, help="Camera height")
+    parser.add_argument("--min_detection_confidence", type=float, default=0.7,
+                       help="Minimum detection confidence")
+    parser.add_argument("--min_tracking_confidence", type=float, default=0.5,
+                       help="Minimum tracking confidence")
+    parser.add_argument("--connection", type=str, default='udp:127.0.0.1:14550',
+                       help="MAVLink connection string")
+    
+    return parser.parse_args()
 
 
 if __name__ == '__main__':
-    main()
+    args = parse_arguments()
+    app = DroneGestureController(args)
+    app.run()
