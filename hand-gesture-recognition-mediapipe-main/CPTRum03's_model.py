@@ -20,7 +20,7 @@ from model import PointHistoryClassifier
 
 def connect_to_sitl():
     try:
-        master = mavutil.mavlink_connection('udp:127.0.0.1:14550')
+        master = mavutil.mavlink_connection('udp:127.0.0.1:14550')  #garbage value for port and ip make sure to change it according to your Arudpilot or PX4 port and laptop IP and check UDP or TCP 
         print("Connected to SITL!")
         return master
     except Exception as e:
@@ -48,72 +48,131 @@ def set_rc_override(master, roll=None, pitch=None, throttle=None, yaw=None):
         master.target_component,
         *rc_channels[:8]  # Send first 8 channels
     )
-def execute_drone_command(master,command,landmark_list=None):
+def execute_drone_command(master, command, landmark_list=None):
     if master is None:
+        print("Error: No MAVLink connection")
         return
-    if command == "Arm":
-         master.mav.command_long_send(
-            master.target_system, master.target_component,
-            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-            0, 1, 0, 0, 0, 0, 0, 0  # 1 = ARM
-        )
-    elif command == "Disarm":
-        master.mav.command_long_send(
-            master.target_system, master.target_component,mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-            0,0,0,0,0,0,0,0)
-    elif command == "Takeoff":
-        master.mav.command_long_send(
-            master.target_system, master.target_component,
-            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-            0, 0, 0, 0, 0, 0, 0, 5  # Altitude = 5m
-        )
-    elif command == "Circle Clockwise":
-        master.mav.command_long_send(
-            master.target_system, master.target_component,
-            mavutil.mavlink.MAV_CMD_DO_GO_AROUND,
-            0, 10, 2, 1, 0, 0, 0, 0  # Radius=10m, speed=2m/s, clockwise=1
-        )
-    elif command == "Circle Counter Clockwise":
-        master.mav.command_long_send(
-            master.target_system, master.target_component,
-            mavutil.mavlink.MAV_CMD_DO_GO_AROUND,
-            0, 10, 2, -1, 0, 0, 0, 0  # Counter-clockwise=-1
-        )
-    elif command == "Yaw Clockwise":
-        master.mav.command_long_send(
-            master.target_system, master.target_component,
-            mavutil.mavlink.MAV_CMD_CONDITION_YAW,
-            0, 360, 30, 1, 1, 0, 0, 0  # 360°, 30°/s, clockwise
-        )
-    elif command == "Yaw Counter Clockwise":
-        master.mav.command_long_send(
-            master.target_system, master.target_component,
-            mavutil.mavlink.MAV_CMD_CONDITION_YAW,
-            0, 360, 30, -1, 1, 0, 0, 0  # Counter-clockwise
-        )
-    elif command == "Return to Land":
-        master.mav.command_long_send(
-            master.target_system, master.target_component,
-            mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
-            0, 0, 0, 0, 0, 0, 0, 0
-        )
-    elif command == "Follow":
-        if landmark_list is None:
-            print("No landmark data availab for follow command")
-            return
-    # Get hand position from landmark 8 (index fingertip)
-        hand_x, hand_y = landmark_list[8][0], landmark_list[8][1]
-    
-    # Convert hand position to drone movement commands
-    # (Example: Move relative to hand position in frame)
-        if hand_x < 300:  # Left edge of frame
-            set_rc_override(master, roll=1400)  # Move left
-        elif hand_x > 600:  # Right edge
-            set_rc_override(master, roll=1600)  # Move right
-        if hand_y < 200:  # Top edge
-            set_rc_override(master, throttle=1600)  # Ascend
-        elif hand_y > 400:  # Bottom edge
-            set_rc_override(master, throttle=1400)  # Descend
+
+    try:
+        # Always ensure we have a heartbeat first
+        master.wait_heartbeat()
+        
+        # Get current mode for debugging
+        current_mode = mavutil.mode_string_v10(master.recv_match(type='HEARTBEAT', blocking=True))
+        print(f"Current mode before command: {current_mode}")
+
+        # CIRCLE COMMANDS
+        if command in ["Circle Clockwise", "Circle Counter Clockwise"]:
+            # Verify CIRCLE mode is available
+            if 'CIRCLE' not in master.mode_mapping():
+                print("Error: CIRCLE mode not available!")
+                return
+
+            # Set CIRCLE mode
+            master.set_mode('CIRCLE')
+            print("Setting CIRCLE mode...")
+
+            # Send circle direction command
+            direction = 1 if command == "Circle Clockwise" else -1
+            master.mav.command_long_send(
+                master.target_system,
+                master.target_component,
+                mavutil.mavlink.MAV_CMD_DO_GO_AROUND,
+                0,       # Confirmation
+                5,       # Radius (meters)
+                2,       # Speed (m/s)
+                direction,  # 1=CW, -1=CCW
+                0, 0, 0, 0  # Unused params
+            )
+            print(f"Executed {command} (Radius:5m, Speed:2m/s)")
+
+        # GUIDED MODE COMMANDS
+        elif command in ["Arm", "Takeoff", "Yaw Clockwise", "Yaw Counter Clockwise"]:
+            # Set GUIDED mode first
+            master.set_mode('GUIDED')
+            print("Setting GUIDED mode...")
+
+            if command == "Arm":
+                master.mav.command_long_send(
+                    master.target_system,
+                    master.target_component,
+                    mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                    0, 1, 0, 0, 0, 0, 0, 0  # 1 = ARM
+                )
+                print("Arm command sent")
+
+            elif command == "Takeoff":
+                master.mav.command_long_send(
+                    master.target_system,
+                    master.target_component,
+                    mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+                    0, 0, 0, 0, 0, 0, 0, 15  # Altitude = 15m
+                )
+                print("Takeoff command sent (15m)")
+
+            elif "Yaw" in command:
+                direction = 1 if "Clockwise" in command else -1
+                master.mav.command_long_send(
+                    master.target_system,
+                    master.target_component,
+                    mavutil.mavlink.MAV_CMD_CONDITION_YAW,
+                    0,       # Confirmation
+                    360,     # Angle (degrees)
+                    30,      # Speed (deg/s)
+                    direction,  # Direction
+                    1,       # Relative (1) or absolute (0)
+                    0, 0, 0  # Unused params
+                )
+                print(f"Yaw command sent ({'CW' if direction==1 else 'CCW'})")
+
+        # SPECIAL MODES (No mode change needed)
+        elif command == "Disarm":
+            master.mav.command_long_send(
+                master.target_system,
+                master.target_component,
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                0, 0, 0, 0, 0, 0, 0, 0  # 0 = DISARM
+            )
+            print("Disarm command sent")
+
+        elif command == "Return to Land":
+            master.mav.command_long_send(
+                master.target_system,
+                master.target_component,
+                mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
+                0, 0, 0, 0, 0, 0, 0, 0
+            )
+            print("RTL command sent")
+
+        elif command == "Follow":
+            if landmark_list is None:
+                print("No landmark data for follow command")
+                return
+                
+            # Get hand position from landmark 8 (index fingertip)
+            hand_x, hand_y = landmark_list[8][0], landmark_list[8][1]
+            
+            # Convert hand position to drone movement commands
+            if hand_x < 300:  # Left edge of frame
+                set_rc_override(master, roll=1400)  # Move left
+            elif hand_x > 600:  # Right edge
+                set_rc_override(master, roll=1600)  # Move right
+            if hand_y < 200:  # Top edge
+                set_rc_override(master, throttle=1600)  # Ascend
+            elif hand_y > 400:  # Bottom edge
+                set_rc_override(master, throttle=1400)  # Descend
+            print("Follow mode active")
+
+        # Verify mode change was successful
+        msg = master.recv_match(type='HEARTBEAT', blocking=True, timeout=3)
+        if msg:
+            new_mode = mavutil.mode_string_v10(msg)
+            print(f"Mode after command: {new_mode}")
+        else:
+            print("Warning: Couldn't verify mode change!")
+
+    except Exception as e:
+        print(f"Command failed: {str(e)}")
 
 
 def get_args():
